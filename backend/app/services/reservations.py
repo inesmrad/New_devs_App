@@ -1,109 +1,129 @@
+import logging
 from datetime import datetime
 from decimal import Decimal
-from typing import Dict, Any, List
+from typing import Any, Dict, Tuple
+from zoneinfo import ZoneInfo
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
-    """
-    Calculates revenue for a specific month.
-    """
+from fastapi import HTTPException
+from sqlalchemy import text
 
-    start_date = datetime(year, month, 1)
-    if month < 12:
-        end_date = datetime(year, month + 1, 1)
-    else:
-        end_date = datetime(year + 1, 1, 1)
-        
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+logger = logging.getLogger(__name__)
 
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
-        FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
-    """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+
+async def _run_with_session(fn):
+    """Open a DB session from the pool and run `fn(session)`."""
+    from app.core.database_pool import DatabasePool
+
+    db_pool = DatabasePool()
+    await db_pool.initialize()
+    if not db_pool.session_factory:
+        raise RuntimeError("Database pool not available")
+    async with db_pool.get_session() as session:
+        return await fn(session)
+
+
+async def _monthly_query(
+    session, property_id: str, tenant_id: str, month: int, year: int
+) -> Tuple[Decimal, int]:
+    """Total and booking count for one calendar month in the PROPERTY's local time zone."""
+    tz_row = (
+        await session.execute(
+            text("SELECT timezone FROM properties WHERE id = :pid AND tenant_id = :tid"),
+            {"pid": property_id, "tid": tenant_id},
+        )
+    ).fetchone()
+
+    # Property doesn't exist for this tenant -> nothing to report (never fall back to UTC/other tenants)
+    if tz_row is None:
+        return Decimal("0"), 0
+
+    tz = ZoneInfo(tz_row.timezone or "UTC")
+    start = datetime(year, month, 1, tzinfo=tz)
+    end = datetime(year + (month == 12), month % 12 + 1, 1, tzinfo=tz)
+
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT COALESCE(SUM(total_amount), 0) AS total, COUNT(*) AS cnt
+                FROM reservations
+                WHERE property_id = :pid
+                  AND tenant_id = :tid
+                  AND check_in_date >= :start
+                  AND check_in_date < :end
+                """
+            ),
+            {"pid": property_id, "tid": tenant_id, "start": start, "end": end},
+        )
+    ).fetchone()
+    return Decimal(str(row.total)), int(row.cnt)
+
+
+async def calculate_monthly_revenue(
+    property_id: str, tenant_id: str, month: int, year: int, session
+) -> Decimal:
+    """Revenue for a specific month, using the property's own time zone for month boundaries."""
+    total, _ = await _monthly_query(session, property_id, tenant_id, month, year)
+    return total
+
+
+async def calculate_monthly_summary(
+    property_id: str, tenant_id: str, month: int, year: int
+) -> Dict[str, Any]:
+    try:
+        total, count = await _run_with_session(
+            lambda s: _monthly_query(s, property_id, tenant_id, month, year)
+        )
+    except Exception as e:
+        logger.error(f"Monthly revenue failed for {property_id} (tenant: {tenant_id}): {e}")
+        raise HTTPException(status_code=503, detail="Revenue data is temporarily unavailable")
+
+    return {
+        "property_id": property_id,
+        "tenant_id": tenant_id,
+        "total": str(total),
+        "currency": "USD",
+        "count": count,
+    }
+
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
-    """
-    Aggregates revenue from database.
-    """
+    """All-time revenue for one property, always scoped to the tenant."""
+
+    async def _query(session):
+        result = await session.execute(
+            text(
+                """
+                SELECT
+                    property_id,
+                    SUM(total_amount) AS total_revenue,
+                    COUNT(*) AS reservation_count
+                FROM reservations
+                WHERE property_id = :property_id AND tenant_id = :tenant_id
+                GROUP BY property_id
+                """
+            ),
+            {"property_id": property_id, "tenant_id": tenant_id},
+        )
+        return result.fetchone()
+
     try:
-        # Import database pool
-        from app.core.database_pool import DatabasePool
-        
-        # Initialize pool if needed
-        db_pool = DatabasePool()
-        await db_pool.initialize()
-        
-        if db_pool.session_factory:
-            async with db_pool.get_session() as session:
-                # Use SQLAlchemy text for raw SQL
-                from sqlalchemy import text
-                
-                query = text("""
-                    SELECT 
-                        property_id,
-                        SUM(total_amount) as total_revenue,
-                        COUNT(*) as reservation_count
-                    FROM reservations 
-                    WHERE property_id = :property_id AND tenant_id = :tenant_id
-                    GROUP BY property_id
-                """)
-                
-                result = await session.execute(query, {
-                    "property_id": property_id, 
-                    "tenant_id": tenant_id
-                })
-                row = result.fetchone()
-                
-                if row:
-                    total_revenue = Decimal(str(row.total_revenue))
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": str(total_revenue),
-                        "currency": "USD", 
-                        "count": row.reservation_count
-                    }
-                else:
-                    # No reservations found for this property
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": "0.00",
-                        "currency": "USD",
-                        "count": 0
-                    }
-        else:
-            raise Exception("Database pool not available")
-            
+        row = await _run_with_session(_query)
     except Exception as e:
-        print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
-        
-        # Create property-specific mock data for testing when DB is unavailable
-        # This ensures each property shows different figures
-        mock_data = {
-            'prop-001': {'total': '1000.00', 'count': 3},
-            'prop-002': {'total': '4975.50', 'count': 4}, 
-            'prop-003': {'total': '6100.50', 'count': 2},
-            'prop-004': {'total': '1776.50', 'count': 4},
-            'prop-005': {'total': '3256.00', 'count': 3}
-        }
-        
-        mock_property_data = mock_data.get(property_id, {'total': '0.00', 'count': 0})
-        
-        return {
-            "property_id": property_id,
-            "tenant_id": tenant_id, 
-            "total": mock_property_data['total'],
-            "currency": "USD",
-            "count": mock_property_data['count']
-        }
+        # Fail loudly: never show made-up financial numbers to a client.
+        logger.error(f"Total revenue failed for {property_id} (tenant: {tenant_id}): {e}")
+        raise HTTPException(status_code=503, detail="Revenue data is temporarily unavailable")
+
+    if row:
+        total = Decimal(str(row.total_revenue))
+        count = int(row.reservation_count)
+    else:
+        total, count = Decimal("0"), 0
+
+    return {
+        "property_id": property_id,
+        "tenant_id": tenant_id,
+        "total": str(total),
+        "currency": "USD",
+        "count": count,
+    }
